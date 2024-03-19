@@ -1,477 +1,466 @@
-name: CI with CMake and Maven
-
-on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
-
-env:
-  # Java version to use for the release
-  RELEASE_JAVA_VERSION: 11
-
 concurrency:
-  group: $GITHUB_REF
   cancel-in-progress: true
-
+  group: $GITHUB_REF
+env:
+  RELEASE_JAVA_VERSION: 11
 jobs:
-  version:
-    name: Prepare version
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      create_tag: ${{ steps.version.outputs.create_tag }}
-      tag_name: ${{ steps.version.outputs.tag_name }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-
-      - name: Set up JDK
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.RELEASE_JAVA_VERSION }}
-          distribution: temurin
-
-      # don't use the setup-java cache option as this only caches what is
-      # necessary for the version, not the other jobs
-      - name: Cache local Maven repository
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-version-
-
-      - name: Parse and set version
-        id: version
-        run: |
-          MVNVER=`mvn help:evaluate -Dexpression=project.version -q -DforceStdout`
-          if [ "$GITHUB_REF" == "refs/heads/master" ]; then
-            TAG_NAME="v${MVNVER/-SNAPSHOT/}"
-            if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1
-            then
-              echo "Creating tag $TAG_NAME"
-              git config --local user.name "$GITHUB_ACTOR via GitHub Actions"
-              git config --local user.email "actions@github.com"
-              git tag -a "$TAG_NAME" -m "Tagged automatically by GitHub Actions ${{ github.workflow }}"
-              echo "create_tag=true" >> $GITHUB_OUTPUT
-            else
-              echo "Tag: $TAG_NAME already exists"
-              echo "create_tag=false" >> $GITHUB_OUTPUT
-            fi
-            VERSION=`git describe --match "v[0-9\.]*" --long --always`
-            VERSION=${VERSION:1}
-          else
-            echo "Not on master"
-            echo "create_tag=false" >> $GITHUB_OUTPUT
-            VERSION=${MVNVER}
-          fi
-          echo "Version: $VERSION"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
-
-  javatest:
-    name: Java ${{ matrix.java }} Test
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        java: [ 11, 17 ]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          submodules: false
-
-      - name: Install Java ${{ matrix.java }}
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ matrix.java }}
-          distribution: temurin
-          cache: maven
-
-      - name: Verify Java
-        run: mvn -B verify -DperformRelease=true
-
-      - name: Upload JNI headers
-        if: matrix.java == env.RELEASE_JAVA_VERSION
-        uses: actions/upload-artifact@v3
-        with:
-          name: jni_headers
-          path: target/native
-
-  ubuntu:
-    name: Linux Static Natives ${{ matrix.arch }}
-    runs-on: ubuntu-20.04
-    needs: javatest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - "x86"
-          - "x86-64"
-          - "arm64"
-          - "ppc64el"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: jni_headers
-          path: target/native
-
-      - name: Install packages for native build
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          # Remove broken packages from pre-installed php in Actions image
-          # No longer needed in ubuntu-22.04
-          sudo apt-get remove -y libpcre2-dev libicu-dev icu-devtools
-          sudo apt-add-repository ppa:ondrej/php -y
-          sudo apt-get install -y aptitude
-          echo "Get::allow-downgrades \"true\";" | sudo tee /etc/apt/apt.conf.d/99-downgrades
-          echo "Get::Assume-Yes \"true\";" | sudo tee -a /etc/apt/apt.conf.d/99-downgrades
-          sudo ./resources/ubuntu-build-image/ppa-purge.sh ppa:ondrej/php -y true
-          if [ "${{ matrix.arch }}" != "x86" ] && [ "${{ matrix.arch }}" != "x86-64" ]; then
-            sudo cp -f resources/ubuntu-build-image/ports-sources.list /etc/apt/sources.list
-          fi
-          sudo ./resources/ubuntu-build-image/packages.sh ${{ matrix.arch }} ${{ env.RELEASE_JAVA_VERSION }}
-
-      - name: Build natives ${{ matrix.arch }}
-        run: ./resources/ubuntu-build-image/build-static.sh ${{ matrix.arch }} ${{ env.RELEASE_JAVA_VERSION }} "$(pwd)"
-
-      - name: Upload Linux ${{ matrix.arch }} natives
-        uses: actions/upload-artifact@v3
-        with:
-          name: linux-${{ matrix.arch }}
-          path: src/main/resources/linux-*/*
-
   deb:
-    name: ${{ matrix.dist.dist }} ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    needs:
-      - version
-      - javatest
-    strategy:
-      fail-fast: false
-      matrix:
-        dist:
-          - { vendor: ubuntu, dist: focal }
-          - { vendor: ubuntu, dist: jammy }
-          - { vendor: ubuntu, dist: lunar }
-          - { vendor: debian, dist: bullseye }
-          - { vendor: debian, dist: bookworm }
-        arch:
-          - amd64
-          - arm64
-          - ppc64el
-        include: [
-          { dist: { vendor: debian, dist: buster }, arch: i386 },
-          { dist: { vendor: debian, dist: bullseye }, arch: i386 },
-          { dist: { vendor: debian, dist: bookworm }, arch: i386 },
-        ]
-
     env:
-      UBUNTUTOOLS_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+      DEBIAN_FRONTEND: noninteractive
       UBUNTUTOOLS_DEBIAN_MIRROR: http://debian-archive.trafficmanager.net/debian/
       UBUNTUTOOLS_DEBSEC_MIRROR: http://debian-archive.trafficmanager.net/debian-security
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: jni_headers
-          path: target/native
-
-      # don't use the setup-java cache option as this only caches what is
-      # necessary for the version, not the other jobs
-      - name: Cache local Maven repository
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-version-
-
-      - name: Install tools
-        run: resources/deb-prepare.sh
-
-      - name: Import GPG key
-        env:
-          GPG_PASSPHRASE: "${{ secrets.GPG_PW }}"
-        run: |
-          cat <(echo -e "${{ secrets.GPG_KEY }}") | gpg --batch --import
-          gpg --list-secret-keys --keyid-format LONG
-
-      - name: Build deb package
-        # the user executing sbuild needs to be in the group sbuild, a relogin is not possible here
-        # bionic doesn't have /bin and /usr/bin merged, thus /bin/bash
-        shell: /usr/bin/sg sbuild -c "/bin/bash -e {0}"
-        env:
-          GPG_PASSPHRASE: "${{ secrets.GPG_PW }}"
-        run: |
-          resources/deb-build.sh \
-            "${{ needs.version.outputs.version }}" \
-            "${{ matrix.dist.dist }}" \
-            "${{ matrix.arch }}"
-
-      - name: Upload package as artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ matrix.dist.vendor }}-${{ matrix.dist.dist }}-${{ matrix.arch }}
-          path: target/debian/${{ matrix.dist.dist }}/*
-
-  windows:
-    name: Windows Natives ${{ matrix.arch.actions }}
-    runs-on: windows-latest
-    needs: javatest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          #- { actions: x86, cmake: Win32, java: "x86" }
-          - { actions: x64, cmake: x64, java: "x86-64" }
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: jni_headers
-          path: target/native
-
-      - name: Install Java ${{ env.RELEASE_JAVA_VERSION }}
-        id: install_java
-        uses: actions/setup-java@v3
-        with:
-          distribution: temurin
-          java-version: ${{ env.RELEASE_JAVA_VERSION }}
-          architecture: ${{ matrix.arch.actions }}
-
-      - name: Build natives
-        run: |
-          git config --global user.email "jitsi-jenkins@jitsi.org"
-          git config --global user.name "Jitsi GitHub Action"
-          cd $Env:GITHUB_WORKSPACE/src/native/
-          $java_home = "${{ steps.install_java.outputs.path }}".Replace("\\", "/")
-          cmake -B cmake-build-${{ matrix.arch.actions }} -DVCPKG_TARGET_TRIPLET=${{ matrix.arch.cmake }}-windows-static -A ${{ matrix.arch.cmake }} -DJAVA_HOME=$java_home
-          cmake --build cmake-build-${{ matrix.arch.actions }} --config Release --target install --parallel
-
-      - name: Gather logs on failure
-        if: ${{ failure() }}
-        run: |
-          Compress-Archive -Path $Env:GITHUB_WORKSPACE/src/native/cmake-build-${{ matrix.arch.actions }} -DestinationPath $Env:GITHUB_WORKSPACE/target/debug-logs.zip
-          Compress-Archive -Path $Env:GITHUB_WORKSPACE/src/native/vcpkg/buildtrees -DestinationPath $Env:GITHUB_WORKSPACE/target/debug-vcpkg.zip
-
-      - name: Upload Debug logs
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v3
-        with:
-          name: win32-debug-${{ matrix.arch.java }}
-          path: target/debug*
-
-      - name: Upload Windows ${{ matrix.arch.actions }} natives
-        uses: actions/upload-artifact@v3
-        with:
-          name: win32-${{ matrix.arch.java }}
-          path: src/main/resources/win32-*/*
-
-  mac:
-    name: Mac Natives ${{ matrix.arch }}
-    runs-on: macos-latest
-    needs: javatest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - x86_64
-          - arm64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: jni_headers
-          path: target/native
-
-      - name: Install Java
-        id: install_java
-        uses: actions/setup-java@v3
-        with:
-          distribution: zulu
-          java-version: ${{ env.RELEASE_JAVA_VERSION }}
-          architecture: ${{ matrix.arch }}
-
-      - name: Build natives
-        run: |
-          git config --global user.email "dev@jitsi.org"
-          git config --global user.name "Jitsi GitHub Action"
-          brew install nasm autoconf automake libtool
-          resources/mac-cmake.sh ${{ steps.install_java.outputs.path }} ${{ matrix.arch }}
-
-      - name: The job has failed
-        if: ${{ failure() }}
-        run: tar --exclude *.o -cvJf target/debug-logs.tar.xz src/native/cmake-build-${{ matrix.arch }}
-
-      - name: Upload Debug logs
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v3
-        with:
-          name: darwin-debug-${{ matrix.arch }}
-          path: target/debug*
-
-      - name: Upload Mac natives
-        uses: actions/upload-artifact@v3
-        with:
-          name: darwin-${{ matrix.arch }}
-          path: src/main/resources/darwin-*/*
-
-  multiplatform:
-    name: Multiplatform Jar
-    runs-on: ubuntu-latest
+      UBUNTUTOOLS_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+    name: ${{ matrix.dist.dist }} ${{ matrix.arch }}
     needs:
-      - javatest
-      - version
-      - ubuntu
-      - windows
-      - mac
-      - deb
+    - version
+    - javatest
+    runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: false
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: true
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: jni_headers
+        path: target/native
+    - continue-on-error: true
+      name: Cache local Maven repository
+      uses: actions/cache@v3
+      with:
+        key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
+        path: ~/.m2/repository
+        restore-keys: '${{ runner.os }}-maven-version-
 
-      - name: Install Java ${{ env.RELEASE_JAVA_VERSION }}
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.RELEASE_JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-          server-id: ossrh
-          server-username: SONATYPE_USER
-          server-password: SONATYPE_PW
+          '
+    - continue-on-error: true
+      name: Install tools
+      run: resources/deb-prepare.sh
+    - continue-on-error: true
+      env:
+        GPG_PASSPHRASE: ${{ secrets.GPG_PW }}
+      name: Import GPG key
+      run: 'cat <(echo -e "${{ secrets.GPG_KEY }}") | gpg --batch --import
 
-      - name: Download binaries
-        uses: actions/download-artifact@v3
-        with:
-          path: target
+        gpg --list-secret-keys --keyid-format LONG
 
-      - name: Copy natives for Maven
-        run: |
-          BASEDIR=$(pwd)/src/main/resources
-          mkdir -p $BASEDIR
-          cd target
-          for dist in */*/ ; do
-            last_dir=$(basename $dist)
-            if [[ "$last_dir" =~ ^(linux|darwin|win32) ]]; then
-              mkdir -p "$BASEDIR/$last_dir" || true
-              cp "$dist"/*.{so,dylib,dll} "$BASEDIR/$last_dir" || true
-            fi;
-          done;
-
-      - name: Release to Maven Central
-        if: github.ref == 'refs/heads/master'
-        env:
-          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-          SONATYPE_PW: ${{ secrets.SONATYPE_PW }}
-        run: |
-          cat <(echo -e "${{ secrets.GPG_KEY }}") | gpg --batch --import
-          gpg --list-secret-keys --keyid-format LONG
-          mvn -B versions:set -DnewVersion=${{ needs.version.outputs.version }} -DgenerateBackupPoms=false
-          mvn \
-            --no-transfer-progress \
-            --batch-mode \
-            -Dgpg.passphrase="${{ secrets.GPG_PW }}" \
-            -DperformRelease=true \
-            -Drelease=true \
-            -Dosgi-native=true \
-            -DskipTests \
-            deploy
-
-      - name: Package on PR
-        if: github.ref != 'refs/heads/master'
-        run: |
-          mvn -B versions:set -DnewVersion=${{ needs.version.outputs.version }} -DgenerateBackupPoms=false
-          mvn \
-            --no-transfer-progress \
-            --batch-mode \
-            -Dgpg.skip \
-            -DperformRelease=true \
-            -Drelease=true \
-            -Dosgi-native=true \
-            -DskipTests \
-            package
-
-      - name: Upload Multi-Platform Jar
-        uses: actions/upload-artifact@v3
-        with:
-          name: jar
-          path: target/*.jar
-          if-no-files-found: error
-
-      - name: Pack all debs to avoid Github filename mangling
-        run: |
-          tar -cvf debian-releases.tar target/{debian-*,ubuntu-*}/*
-
-      - name: Create release
-        if: github.ref == 'refs/heads/master'
-        uses: ncipollo/release-action@37c87f6b53fb46d40450c3cac428aa83c8d0055f
-        with:
-          artifacts: "target/*.jar,debian-releases.tar"
-          allowUpdates: true
-          prerelease: true
-          draft: false
-          tag: r${{ needs.version.outputs.version }}
-          omitBody: true
-          removeArtifacts: true
-          replacesArtifacts: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifactErrorsFailBuild: true
-
-      - name: Tag
-        if: needs.version.outputs.create_tag == 'true'
-        run: |
-          git config --local user.name "$GITHUB_ACTOR via GitHub Actions"
-          git config --local user.email "actions@github.com"
-          git tag -a "${{ needs.version.outputs.tag_name }}" -m "Tagged automatically by GitHub Actions ${{ github.workflow }}"
-          git push origin "${{ needs.version.outputs.tag_name }}"
-
+        '
+    - continue-on-error: true
+      env:
+        GPG_PASSPHRASE: ${{ secrets.GPG_PW }}
+      name: Build deb package
+      run: "resources/deb-build.sh \\\n  \"${{ needs.version.outputs.version }}\"\
+        \ \\\n  \"${{ matrix.dist.dist }}\" \\\n  \"${{ matrix.arch }}\"\n"
+      shell: /usr/bin/sg sbuild -c "/bin/bash -e {0}"
+    - continue-on-error: true
+      name: Upload package as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.dist.vendor }}-${{ matrix.dist.dist }}-${{ matrix.arch }}
+        path: target/debian/${{ matrix.dist.dist }}/*
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - amd64
+        - arm64
+        - ppc64el
+        dist:
+        - dist: focal
+          vendor: ubuntu
+        - dist: jammy
+          vendor: ubuntu
+        - dist: lunar
+          vendor: ubuntu
+        - dist: bullseye
+          vendor: debian
+        - dist: bookworm
+          vendor: debian
+        include:
+        - arch: i386
+          dist:
+            dist: buster
+            vendor: debian
+        - arch: i386
+          dist:
+            dist: bullseye
+            vendor: debian
+        - arch: i386
+          dist:
+            dist: bookworm
+            vendor: debian
   deploy:
-    name: Deploy Debian packages
     if: github.ref == 'refs/heads/master'
+    name: Deploy Debian packages
     needs:
-      - version
-      - multiplatform
-      - deb
+    - version
+    - multiplatform
+    - deb
+    secrets: inherit
     uses: ./.github/workflows/deploy-debian.yml
     with:
       release_type: unstable
       tag: r${{ needs.version.outputs.version }}
-    secrets: inherit
+  javatest:
+    name: Java ${{ matrix.java }} Test
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: false
+    - continue-on-error: true
+      name: Install Java ${{ matrix.java }}
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - continue-on-error: true
+      name: Verify Java
+      run: mvn -B verify -DperformRelease=true
+    - continue-on-error: true
+      if: matrix.java == env.RELEASE_JAVA_VERSION
+      name: Upload JNI headers
+      uses: actions/upload-artifact@v3
+      with:
+        name: jni_headers
+        path: target/native
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        - 11
+        - 17
+  mac:
+    name: Mac Natives ${{ matrix.arch }}
+    needs: javatest
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: true
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: jni_headers
+        path: target/native
+    - continue-on-error: true
+      id: install_java
+      name: Install Java
+      uses: actions/setup-java@v3
+      with:
+        architecture: ${{ matrix.arch }}
+        distribution: zulu
+        java-version: ${{ env.RELEASE_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Build natives
+      run: 'git config --global user.email "dev@jitsi.org"
+
+        git config --global user.name "Jitsi GitHub Action"
+
+        brew install nasm autoconf automake libtool
+
+        resources/mac-cmake.sh ${{ steps.install_java.outputs.path }} ${{ matrix.arch
+        }}
+
+        '
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: The job has failed
+      run: tar --exclude *.o -cvJf target/debug-logs.tar.xz src/native/cmake-build-${{
+        matrix.arch }}
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: Upload Debug logs
+      uses: actions/upload-artifact@v3
+      with:
+        name: darwin-debug-${{ matrix.arch }}
+        path: target/debug*
+    - continue-on-error: true
+      name: Upload Mac natives
+      uses: actions/upload-artifact@v3
+      with:
+        name: darwin-${{ matrix.arch }}
+        path: src/main/resources/darwin-*/*
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - x86_64
+        - arm64
+  multiplatform:
+    name: Multiplatform Jar
+    needs:
+    - javatest
+    - version
+    - ubuntu
+    - windows
+    - mac
+    - deb
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: false
+    - continue-on-error: true
+      name: Install Java ${{ env.RELEASE_JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: ${{ env.RELEASE_JAVA_VERSION }}
+        server-id: ossrh
+        server-password: SONATYPE_PW
+        server-username: SONATYPE_USER
+    - continue-on-error: true
+      name: Download binaries
+      uses: actions/download-artifact@v3
+      with:
+        path: target
+    - continue-on-error: true
+      name: Copy natives for Maven
+      run: "BASEDIR=$(pwd)/src/main/resources\nmkdir -p $BASEDIR\ncd target\nfor dist\
+        \ in */*/ ; do\n  last_dir=$(basename $dist)\n  if [[ \"$last_dir\" =~ ^(linux|darwin|win32)\
+        \ ]]; then\n    mkdir -p \"$BASEDIR/$last_dir\" || true\n    cp \"$dist\"\
+        /*.{so,dylib,dll} \"$BASEDIR/$last_dir\" || true\n  fi;\ndone;\n"
+    - continue-on-error: true
+      env:
+        SONATYPE_PW: ${{ secrets.SONATYPE_PW }}
+        SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
+      if: github.ref == 'refs/heads/master'
+      name: Release to Maven Central
+      run: "cat <(echo -e \"${{ secrets.GPG_KEY }}\") | gpg --batch --import\ngpg\
+        \ --list-secret-keys --keyid-format LONG\nmvn -B versions:set -DnewVersion=${{\
+        \ needs.version.outputs.version }} -DgenerateBackupPoms=false\nmvn \\\n  --no-transfer-progress\
+        \ \\\n  --batch-mode \\\n  -Dgpg.passphrase=\"${{ secrets.GPG_PW }}\" \\\n\
+        \  -DperformRelease=true \\\n  -Drelease=true \\\n  -Dosgi-native=true \\\n\
+        \  -DskipTests \\\n  deploy\n"
+    - continue-on-error: true
+      if: github.ref != 'refs/heads/master'
+      name: Package on PR
+      run: "mvn -B versions:set -DnewVersion=${{ needs.version.outputs.version }}\
+        \ -DgenerateBackupPoms=false\nmvn \\\n  --no-transfer-progress \\\n  --batch-mode\
+        \ \\\n  -Dgpg.skip \\\n  -DperformRelease=true \\\n  -Drelease=true \\\n \
+        \ -Dosgi-native=true \\\n  -DskipTests \\\n  package\n"
+    - continue-on-error: true
+      name: Upload Multi-Platform Jar
+      uses: actions/upload-artifact@v3
+      with:
+        if-no-files-found: error
+        name: jar
+        path: target/*.jar
+    - continue-on-error: true
+      name: Pack all debs to avoid Github filename mangling
+      run: 'tar -cvf debian-releases.tar target/{debian-*,ubuntu-*}/*
+
+        '
+    - continue-on-error: true
+      if: github.ref == 'refs/heads/master'
+      name: Create release
+      uses: ncipollo/release-action@37c87f6b53fb46d40450c3cac428aa83c8d0055f
+      with:
+        allowUpdates: true
+        artifactErrorsFailBuild: true
+        artifacts: target/*.jar,debian-releases.tar
+        draft: false
+        omitBody: true
+        prerelease: true
+        removeArtifacts: true
+        replacesArtifacts: true
+        tag: r${{ needs.version.outputs.version }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+    - continue-on-error: true
+      if: needs.version.outputs.create_tag == 'true'
+      name: Tag
+      run: 'git config --local user.name "$GITHUB_ACTOR via GitHub Actions"
+
+        git config --local user.email "actions@github.com"
+
+        git tag -a "${{ needs.version.outputs.tag_name }}" -m "Tagged automatically
+        by GitHub Actions ${{ github.workflow }}"
+
+        git push origin "${{ needs.version.outputs.tag_name }}"
+
+        '
+  ubuntu:
+    name: Linux Static Natives ${{ matrix.arch }}
+    needs: javatest
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: true
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: jni_headers
+        path: target/native
+    - continue-on-error: true
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      name: Install packages for native build
+      run: "# Remove broken packages from pre-installed php in Actions image\n# No\
+        \ longer needed in ubuntu-22.04\nsudo apt-get remove -y libpcre2-dev libicu-dev\
+        \ icu-devtools\nsudo apt-add-repository ppa:ondrej/php -y\nsudo apt-get install\
+        \ -y aptitude\necho \"Get::allow-downgrades \\\"true\\\";\" | sudo tee /etc/apt/apt.conf.d/99-downgrades\n\
+        echo \"Get::Assume-Yes \\\"true\\\";\" | sudo tee -a /etc/apt/apt.conf.d/99-downgrades\n\
+        sudo ./resources/ubuntu-build-image/ppa-purge.sh ppa:ondrej/php -y true\n\
+        if [ \"${{ matrix.arch }}\" != \"x86\" ] && [ \"${{ matrix.arch }}\" != \"\
+        x86-64\" ]; then\n  sudo cp -f resources/ubuntu-build-image/ports-sources.list\
+        \ /etc/apt/sources.list\nfi\nsudo ./resources/ubuntu-build-image/packages.sh\
+        \ ${{ matrix.arch }} ${{ env.RELEASE_JAVA_VERSION }}\n"
+    - continue-on-error: true
+      name: Build natives ${{ matrix.arch }}
+      run: ./resources/ubuntu-build-image/build-static.sh ${{ matrix.arch }} ${{ env.RELEASE_JAVA_VERSION
+        }} "$(pwd)"
+    - continue-on-error: true
+      name: Upload Linux ${{ matrix.arch }} natives
+      uses: actions/upload-artifact@v3
+      with:
+        name: linux-${{ matrix.arch }}
+        path: src/main/resources/linux-*/*
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - x86
+        - x86-64
+        - arm64
+        - ppc64el
+  version:
+    name: Prepare version
+    outputs:
+      create_tag: ${{ steps.version.outputs.create_tag }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      version: ${{ steps.version.outputs.version }}
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - continue-on-error: true
+      name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        distribution: temurin
+        java-version: ${{ env.RELEASE_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Cache local Maven repository
+      uses: actions/cache@v3
+      with:
+        key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
+        path: ~/.m2/repository
+        restore-keys: '${{ runner.os }}-maven-version-
+
+          '
+    - continue-on-error: true
+      id: version
+      name: Parse and set version
+      run: "MVNVER=`mvn help:evaluate -Dexpression=project.version -q -DforceStdout`\n\
+        if [ \"$GITHUB_REF\" == \"refs/heads/master\" ]; then\n  TAG_NAME=\"v${MVNVER/-SNAPSHOT/}\"\
+        \n  if ! git rev-parse \"$TAG_NAME\" >/dev/null 2>&1\n  then\n    echo \"\
+        Creating tag $TAG_NAME\"\n    git config --local user.name \"$GITHUB_ACTOR\
+        \ via GitHub Actions\"\n    git config --local user.email \"actions@github.com\"\
+        \n    git tag -a \"$TAG_NAME\" -m \"Tagged automatically by GitHub Actions\
+        \ ${{ github.workflow }}\"\n    echo \"create_tag=true\" >> $GITHUB_OUTPUT\n\
+        \  else\n    echo \"Tag: $TAG_NAME already exists\"\n    echo \"create_tag=false\"\
+        \ >> $GITHUB_OUTPUT\n  fi\n  VERSION=`git describe --match \"v[0-9\\.]*\"\
+        \ --long --always`\n  VERSION=${VERSION:1}\nelse\n  echo \"Not on master\"\
+        \n  echo \"create_tag=false\" >> $GITHUB_OUTPUT\n  VERSION=${MVNVER}\nfi\n\
+        echo \"Version: $VERSION\"\necho \"version=${VERSION}\" >> $GITHUB_OUTPUT\n\
+        echo \"tag_name=${TAG_NAME}\" >> $GITHUB_OUTPUT\n"
+  windows:
+    name: Windows Natives ${{ matrix.arch.actions }}
+    needs: javatest
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: true
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: jni_headers
+        path: target/native
+    - continue-on-error: true
+      id: install_java
+      name: Install Java ${{ env.RELEASE_JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        architecture: ${{ matrix.arch.actions }}
+        distribution: temurin
+        java-version: ${{ env.RELEASE_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Build natives
+      run: 'git config --global user.email "jitsi-jenkins@jitsi.org"
+
+        git config --global user.name "Jitsi GitHub Action"
+
+        cd $Env:GITHUB_WORKSPACE/src/native/
+
+        $java_home = "${{ steps.install_java.outputs.path }}".Replace("\\", "/")
+
+        cmake -B cmake-build-${{ matrix.arch.actions }} -DVCPKG_TARGET_TRIPLET=${{
+        matrix.arch.cmake }}-windows-static -A ${{ matrix.arch.cmake }} -DJAVA_HOME=$java_home
+
+        cmake --build cmake-build-${{ matrix.arch.actions }} --config Release --target
+        install --parallel
+
+        '
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: Gather logs on failure
+      run: 'Compress-Archive -Path $Env:GITHUB_WORKSPACE/src/native/cmake-build-${{
+        matrix.arch.actions }} -DestinationPath $Env:GITHUB_WORKSPACE/target/debug-logs.zip
+
+        Compress-Archive -Path $Env:GITHUB_WORKSPACE/src/native/vcpkg/buildtrees -DestinationPath
+        $Env:GITHUB_WORKSPACE/target/debug-vcpkg.zip
+
+        '
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: Upload Debug logs
+      uses: actions/upload-artifact@v3
+      with:
+        name: win32-debug-${{ matrix.arch.java }}
+        path: target/debug*
+    - continue-on-error: true
+      name: Upload Windows ${{ matrix.arch.actions }} natives
+      uses: actions/upload-artifact@v3
+      with:
+        name: win32-${{ matrix.arch.java }}
+        path: src/main/resources/win32-*/*
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - actions: x64
+          cmake: x64
+          java: x86-64
+name: CI with CMake and Maven
+on:
+  repository_dispatch:
+    types: trigger-ga___maven-and-native.yml
